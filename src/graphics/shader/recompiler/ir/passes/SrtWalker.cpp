@@ -379,33 +379,54 @@ bool IsUserDataWord(const ResourcePlan& program, const Inst& inst) {
 	       RegIndex(inst.Arg(0).ScalarRegister()) >= program.user_data_base;
 }
 
-// A scalar-address read with a constant offset whose pointer words are user data or such reads.
-// Clean reads keep the strict reader of the clean evaluator.
-bool IsCompiledRead(const ResourcePlan& program, const Inst& inst, uint32_t depth = 0) {
-	if (depth > 16 || inst.GetOpcode() != ValueOpcode::LoadAddressU32 || inst.NumArgs() < 2 ||
-	    !IsRawRead(program, inst) || inst.Flags<SrtReadFlags>().clean != 0u)
+bool IsCompiledRead(const ResourcePlan& program, const Inst& inst, uint32_t depth = 0);
+
+// User data or a compiled read: a handle word or a constant-buffer index.
+bool IsCompiledWord(const ResourcePlan& program, Value value, uint32_t depth) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr &&
+	       (IsUserDataWord(program, *inst) || IsCompiledRead(program, *inst, depth + 1));
+}
+
+// A scalar-address read with a constant offset, or a constant-buffer read at a constant or
+// shifted-index offset, whose handle words are compiled words. Clean reads keep the strict
+// reader of the clean evaluator; a negative buffer immediate fails in the walker.
+bool IsCompiledRead(const ResourcePlan& program, const Inst& inst, uint32_t depth) {
+	const auto op = inst.GetOpcode();
+	if (depth > 16 || (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) ||
+	    inst.NumArgs() < 2 || !IsRawRead(program, inst) || inst.Flags<SrtReadFlags>().clean != 0u)
 		return false;
-	const auto  offset = inst.Arg(1).Resolve();
-	const auto* handle = inst.Arg(0).Resolve().TryInstruction();
-	if (!offset.IsImmediate() || offset.GetType() != Type::U32 || handle == nullptr ||
-	    handle->GetOpcode() != ValueOpcode::GetAddressResource || handle->NumArgs() != 2)
+	const auto  offset    = inst.Arg(1).Resolve();
+	const auto* handle    = inst.Arg(0).Resolve().TryInstruction();
+	const bool  buffer    = op == ValueOpcode::ReadConstBuffer;
+	const auto  immediate = [](Value value) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32;
+	};
+	const auto* shift = offset.TryInstruction();
+	const bool  index = buffer && shift != nullptr &&
+	                    shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+	                    shift->NumArgs() == 2 && immediate(shift->Arg(1)) &&
+	                    IsCompiledWord(program, shift->Arg(0), depth);
+	if ((!immediate(offset) && !index) || handle == nullptr ||
+	    handle->GetOpcode() !=
+	        (buffer ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource) ||
+	    handle->NumArgs() != (buffer ? 4u : 2u) ||
+	    (buffer &&
+	     static_cast<int32_t>(program.memory_info[inst.Flags<SrtReadFlags>().index].offset) < 0))
 		return false;
-	for (size_t word = 0; word < 2; ++word) {
-		const auto* source = handle->Arg(word).Resolve().TryInstruction();
-		if (source == nullptr ||
-		    (!IsUserDataWord(program, *source) && !IsCompiledRead(program, *source, depth + 1)))
-			return false;
+	for (size_t word = 0; word < handle->NumArgs(); ++word) {
+		if (!IsCompiledWord(program, handle->Arg(word), depth)) return false;
 	}
 	return true;
 }
 
 // Compiles the SRT slots of plans the whole-plan walker rejects (block conditions, captured
-// reads): one entry per slot, one memoized routine per read. Other slots stay interpreted.
-void CompileSrtReads(ResourcePlan& program) {
-	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
-	    program.srt_reads.empty())
-		return;
-	std::vector<const Inst*> slots(program.srt_reads.size(), nullptr);
+// reads) and the descriptors whose DWORDs are all such reads, user data or immediates: one entry
+// per slot or descriptor, one memoized routine per read. Others stay interpreted.
+void CompileSrtReads(ResourcePlan& program, bool compile_slots) {
+	if (!program.resource_tracking_complete || !program.srt_plan_complete) return;
+	std::vector<const Inst*> slots(compile_slots ? program.srt_reads.size() : 0u, nullptr);
 	bool                     any = false;
 	for (uint32_t slot = 0; slot < slots.size(); ++slot) {
 		const auto& read = program.srt_reads[slot];
@@ -416,6 +437,26 @@ void CompileSrtReads(ResourcePlan& program) {
 			any         = true;
 		}
 	}
+	const auto compiled_dword = [&](Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return value.GetType() == Type::U32;
+		const auto* inst = value.TryInstruction();
+		return inst != nullptr &&
+		       (IsUserDataWord(program, *inst) || IsCompiledRead(program, *inst));
+	};
+	std::vector<bool> descriptors(program.descriptor_sources.size(), false);
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		const auto& descriptor = program.descriptor_sources[source];
+		const auto  dwords =
+		    std::span(descriptor.dwords)
+		        .first(std::min<size_t>(descriptor.dword_count, descriptor.dwords.size()));
+		descriptors[source] = descriptor.dword_count != 0u &&
+		                      descriptor.dword_count <= descriptor.dwords.size() &&
+		                      std::ranges::all_of(dwords, compiled_dword);
+		any |= descriptors[source];
+	}
+	program.srt_read_entries.assign(program.srt_reads.size(), UINT32_MAX);
+	program.srt_descriptor_entries.assign(program.descriptor_sources.size(), UINT32_MAX);
 	if (!any) return;
 
 	using Entry           = ResourcePlan::EvaluationContext::Entry;
@@ -431,7 +472,6 @@ void CompileSrtReads(ResourcePlan& program) {
 		if (inserted) pending.push_back(inst);
 		return found->second;
 	};
-	program.srt_read_entries.assign(slots.size(), UINT32_MAX);
 	for (uint32_t slot = 0; slot < slots.size(); ++slot) {
 		if (slots[slot] == nullptr) continue;
 		program.srt_read_entries[slot] = static_cast<uint32_t>(code.getSize());
@@ -441,6 +481,37 @@ void CompileSrtReads(ResourcePlan& program) {
 		code.call(routine(slots[slot]));
 		code.mov(code.dword[code.rsi + program.srt_reads[slot].flat_offset * sizeof(uint32_t)],
 		         code.eax);
+		code.mov(code.qword[code.r9], code.r11);
+		code.mov(code.eax, 1);
+		code.pop(code.rbp);
+		code.ret();
+	}
+	// rsi points at the descriptor DWORDs; they are filled in order, as the interpreter does.
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		if (!descriptors[source]) continue;
+		program.srt_descriptor_entries[source] = static_cast<uint32_t>(code.getSize());
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.mov(code.r11, code.qword[code.r9]);
+		const auto& descriptor = program.descriptor_sources[source];
+		for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+			const auto value = descriptor.dwords[index].Resolve();
+			const auto dword = code.dword[code.rsi + index * sizeof(uint32_t)];
+			if (value.IsImmediate()) {
+				code.mov(dword, value.U32());
+				continue;
+			}
+			const auto* inst = value.TryInstruction();
+			if (IsUserDataWord(program, *inst)) {
+				const auto word = RegIndex(inst->Arg(0).ScalarRegister()) - program.user_data_base;
+				code.cmp(code.r8, word);
+				code.jbe(failed, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.eax, code.dword[code.rdi + word * sizeof(uint32_t)]);
+			} else {
+				code.call(routine(inst));
+			}
+			code.mov(dword, code.eax);
+		}
 		code.mov(code.qword[code.r9], code.r11);
 		code.mov(code.eax, 1);
 		code.pop(code.rbp);
@@ -466,8 +537,8 @@ void CompileSrtReads(ResourcePlan& program) {
 		code.ret();
 		code.L(compute);
 		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-		for (size_t word = 0; word < 2; ++word) {
-			const auto* source = handle->Arg(word).Resolve().TryInstruction();
+		const auto  load   = [&](Value value) {
+			const auto* source = value.Resolve().TryInstruction();
 			if (IsUserDataWord(program, *source)) {
 				const auto index =
 				    RegIndex(source->Arg(0).ScalarRegister()) - program.user_data_base;
@@ -477,29 +548,76 @@ void CompileSrtReads(ResourcePlan& program) {
 			} else {
 				code.call(routine(source));
 			}
-			if (word == 0) code.push(code.rax);
-		}
-		code.mov(code.r10d, code.eax);
-		code.pop(code.rax);
-		code.shl(code.r10, 32);
-		code.or_(code.rax, code.r10);
-		code.mov(code.r10, AddressMask & ~uint64_t {3});
-		code.and_(code.rax, code.r10);
-		const auto& memory = program.memory_info[inst->Flags<SrtReadFlags>().index];
-		const auto  relative =
-		    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3}) +
-		    static_cast<int64_t>(inst->Arg(1).Resolve().U32() & ~3u);
-		if (relative < 0) {
-			code.mov(code.r10, -relative);
-			code.cmp(code.rax, code.r10);
+		};
+		const auto& memory    = program.memory_info[inst->Flags<SrtReadFlags>().index];
+		const auto  immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
+		if (handle->NumArgs() == 4u) {
+			// Constant buffer: base, offset, then records and word 3 (read, unused), in the
+			// walker's order. The DWORD must fit in records, or stride * records bytes.
+			const auto offset = inst->Arg(1).Resolve();
+			load(handle->Arg(0));
+			code.push(code.rax);
+			load(handle->Arg(1));
+			code.push(code.rax);
+			if (offset.IsImmediate()) {
+				code.mov(code.eax, offset.U32() & ~3u);
+			} else {
+				const auto* shift = offset.TryInstruction();
+				load(shift->Arg(0));
+				code.shl(code.eax, shift->Arg(1).Resolve().U32() & 31u);
+				code.and_(code.eax, ~3u);
+			}
+			code.push(code.rax);
+			load(handle->Arg(2));
+			code.push(code.rax);
+			load(handle->Arg(3));
+			Xbyak::Label sized;
+			code.pop(code.r10);
+			code.mov(code.eax, code.dword[code.rsp + 8]);
+			code.shr(code.eax, 16);
+			code.and_(code.eax, 0x3fffu);
+			code.jz(sized);
+			code.imul(code.r10, code.rax);
+			code.L(sized);
+			code.pop(code.rax);
+			if (const auto part = static_cast<uint64_t>(immediate) & ~uint64_t {3}; part != 0)
+				code.add(code.rax, static_cast<uint32_t>(part));
+			code.sub(code.r10, sizeof(uint32_t));
 			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
-			code.sub(code.rax, code.r10);
-		} else if (relative > 0) {
-			code.mov(code.r10, AddressMask - static_cast<uint64_t>(relative));
-			code.cmp(code.rax, code.r10);
-			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
-			code.mov(code.r10, relative);
+			code.cmp(code.r10, code.rax);
+			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+			code.pop(code.r10);
+			code.shl(code.r10, 32);
+			code.or_(code.r10, code.qword[code.rsp]);
+			code.add(code.rsp, sizeof(uint64_t));
+			code.shl(code.r10, 16);
+			code.shr(code.r10, 16);
+			code.and_(code.r10, -4);
 			code.add(code.rax, code.r10);
+		} else {
+			load(handle->Arg(0));
+			code.push(code.rax);
+			load(handle->Arg(1));
+			code.mov(code.r10d, code.eax);
+			code.pop(code.rax);
+			code.shl(code.r10, 32);
+			code.or_(code.rax, code.r10);
+			code.mov(code.r10, AddressMask & ~uint64_t {3});
+			code.and_(code.rax, code.r10);
+			const auto relative = (immediate & ~int64_t {3}) +
+			                      static_cast<int64_t>(inst->Arg(1).Resolve().U32() & ~3u);
+			if (relative < 0) {
+				code.mov(code.r10, -relative);
+				code.cmp(code.rax, code.r10);
+				code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+				code.sub(code.rax, code.r10);
+			} else if (relative > 0) {
+				code.mov(code.r10, AddressMask - static_cast<uint64_t>(relative));
+				code.cmp(code.rax, code.r10);
+				code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.r10, relative);
+				code.add(code.rax, code.r10);
+			}
 		}
 		code.mov(code.qword[code.r11], code.rax);
 		code.add(code.r11, sizeof(uint64_t));
@@ -642,14 +760,20 @@ void CompileTreeWalker(ResourcePlan& program) {
 
 void CompileSrtWalker(ResourcePlan& program) {
 	CompileTreeWalker(program);
-	if (program.srt_code == nullptr) CompileSrtReads(program);
+	CompileSrtReads(program, program.srt_code == nullptr);
 }
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_session(this),
-      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator), m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {
+	// Compiled reads use mapped memory directly, as the ordinary reader of a capture does.
+	// Child walkers carry an EXEC mask and keep the interpreted reads.
+	m_captured_ranges = SrtReadCapture::DirectRanges(m_runtime);
+	m_compiled_reads  = m_program.srt_read_code &&
+	                    (m_runtime.read_memory == nullptr || m_captured_ranges != nullptr);
+	if (m_compiled_reads) m_context.values.resize(m_program.evaluation_value_count);
+}
 
 SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
                      SrtWalker* clean_evaluator)
@@ -1279,6 +1403,25 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	}
 	return false;
 }
+
+bool SrtWalker::CallCompiledRead(uint32_t entry, uint32_t* out) {
+	if (!m_compiled_reads) return false;
+	using Read =
+	    bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, ResourcePlan::EvaluationContext::Entry*,
+	                           uint64_t, size_t, uint64_t**);
+	auto* const addresses = m_program.srt_read_addresses.data();
+	auto*       cursor    = addresses;
+	const bool  ok = reinterpret_cast<Read>(m_program.srt_read_code->getCode<uint8_t*>() + entry)(
+	    m_runtime.user_data.data(), out, m_context.values.data(), m_context.generation,
+	    m_runtime.user_data.size(), &cursor);
+	if (m_captured_ranges != nullptr) {
+		for (const auto* address = addresses; address != cursor; ++address) {
+			m_captured_ranges->emplace_back(*address, sizeof(uint32_t));
+		}
+	}
+	return ok;
+}
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
@@ -1286,6 +1429,13 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
 	result.dword_count = descriptor.dword_count;
+	// A failed compiled read is evaluated again below, with the walker's own result.
+	if (source < m_program.srt_descriptor_entries.size() &&
+	    m_program.srt_descriptor_entries[source] != UINT32_MAX &&
+	    CallCompiledRead(m_program.srt_descriptor_entries[source], result.dwords.data())) {
+		return true;
+	}
+	result.dwords = {};
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -1305,31 +1455,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
-	// Compiled slots read mapped memory directly, as the ordinary reader of a capture does.
-	auto*      captured = SrtReadCapture::DirectRanges(m_runtime);
-	const bool compiled = m_program.srt_read_code && m_active_mask.IsEmpty() &&
-	                      (m_runtime.read_memory == nullptr || captured != nullptr);
-	if (compiled) m_context.values.resize(m_program.evaluation_value_count);
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
-		if (compiled && m_program.srt_read_entries[slot] != UINT32_MAX) {
-			using Read = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
-			                                    ResourcePlan::EvaluationContext::Entry*, uint64_t,
-			                                    size_t, uint64_t**);
-			auto* const       addresses = m_program.srt_read_addresses.data();
-			auto*             cursor    = addresses;
-			const bool ok = reinterpret_cast<Read>(m_program.srt_read_code->getCode<uint8_t*>() +
-			                                       m_program.srt_read_entries[slot])(
-			    m_runtime.user_data.data(), flat.data(), m_context.values.data(),
-			    m_context.generation, m_runtime.user_data.size(), &cursor);
-			if (captured != nullptr) {
-				for (const auto* address = addresses; address != cursor; ++address) {
-					captured->emplace_back(*address, sizeof(uint32_t));
-				}
-			}
-			// A failed read is evaluated again below, with the walker's own result.
-			if (ok) return true;
-		}
+		// A failed compiled read is evaluated again below, with the walker's own result.
+		if (slot < m_program.srt_read_entries.size() &&
+		    m_program.srt_read_entries[slot] != UINT32_MAX &&
+		    CallCompiledRead(m_program.srt_read_entries[slot], flat.data()))
+			return true;
 		const auto& read = m_program.srt_reads[slot];
 		const auto* inst = read.value.ResolveInstruction();
 		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;

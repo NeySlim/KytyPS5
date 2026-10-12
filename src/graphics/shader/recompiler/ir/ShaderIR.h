@@ -692,10 +692,11 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	// Per-slot compiled reads when srt_code is absent: entry offsets (UINT32_MAX: interpreted)
-	// and room for the addresses one slot reads.
+	// Compiled reads: per-slot entry offsets when srt_code is absent and per-descriptor entries
+	// that fill every DWORD (UINT32_MAX: interpreted), and room for the addresses one entry reads.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_read_code;
 	std::vector<uint32_t>                 srt_read_entries;
+	std::vector<uint32_t>                 srt_descriptor_entries;
 	mutable std::vector<uint64_t>         srt_read_addresses;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;

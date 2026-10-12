@@ -124,6 +124,8 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// Runs a compiled slot or descriptor entry; false when it fails or cannot run here.
+	bool CallCompiledRead(uint32_t entry, uint32_t* out);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -133,6 +135,8 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	std::vector<std::pair<uint64_t, uint64_t>>* m_captured_ranges = nullptr;
+	bool                                        m_compiled_reads  = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
