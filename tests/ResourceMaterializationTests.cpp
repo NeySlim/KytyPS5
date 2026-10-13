@@ -348,7 +348,7 @@ void TestCompiledSrtReadsFollowBlocks() {
 
   auto plan = ExtractResourcePlan(program);
   Check(plan.capture_specialization_reads && plan.control_flow.size() == 3 &&
-            plan.srt_code == nullptr && plan.srt_read_code != nullptr &&
+            plan.srt_code == nullptr && plan.srt_read_table != nullptr &&
             plan.srt_read_entries ==
                 std::vector<uint32_t>{plan.srt_read_entries[0], plan.srt_read_entries[1],
                                       UINT32_MAX, plan.srt_read_entries[3],
@@ -356,7 +356,7 @@ void TestCompiledSrtReadsFollowBlocks() {
             plan.srt_read_entries[0] != UINT32_MAX && plan.srt_read_entries[4] != UINT32_MAX,
         "captured block plan did not compile exactly its ordinary scalar reads");
   auto interpreted = ExtractResourcePlan(program);
-  interpreted.srt_read_code.reset();
+  interpreted.srt_read_table.reset();
   struct Strict { uint32_t reads = 0; } strict;
   const auto runtime = [&](std::span<const uint32_t> words) {
     return SrtRuntime{
@@ -438,10 +438,10 @@ void TestCompiledSrtReadsFollowBlocks() {
     program.memory_info[0].offset = static_cast<uint32_t>(offset);
     auto bounded = ExtractResourcePlan(program);
     auto reference = ExtractResourcePlan(program);
-    reference.srt_read_code.reset();
+    reference.srt_read_table.reset();
     std::array<uint32_t, 3> edge = offset < 0 ? std::array<uint32_t, 3>{0x80u, 0u, 0u}
                                               : std::array<uint32_t, 3>{0xfffffff0u, 0xffffu, 0u};
-    Check(bounded.srt_read_code != nullptr &&
+    Check(bounded.srt_read_table != nullptr &&
               !MaterializeResources(bounded, runtime(edge), snapshot, specialization) &&
               !MaterializeResources(reference, runtime(edge), snapshot, specialization),
           "compiled SRT slots accepted address underflow or 48-bit overflow");
@@ -563,7 +563,7 @@ void TestCompiledSrtDescriptorReads() {
     }
 
     auto plan = ExtractResourcePlan(program);
-    Check(plan.srt_read_code != nullptr && (plan.srt_code == nullptr) == blocks &&
+    Check(plan.srt_read_table != nullptr && (plan.srt_code == nullptr) == blocks &&
               plan.srt_descriptor_entries.size() == 6 &&
               plan.srt_descriptor_entries[4] != UINT32_MAX &&
               plan.srt_descriptor_entries[5] != UINT32_MAX &&
@@ -574,7 +574,7 @@ void TestCompiledSrtDescriptorReads() {
               plan.srt_descriptor_entries[3] == UINT32_MAX,
           "SRT plan did not compile exactly its descriptors of compiled reads");
     auto interpreted = ExtractResourcePlan(program);
-    interpreted.srt_read_code.reset();
+    interpreted.srt_read_table.reset();
     uint32_t strict_reads = 0;
     const auto runtime = [&](std::span<const uint32_t> words) {
       return SrtRuntime{
@@ -680,7 +680,7 @@ void TestCompiledSrtDescriptorReads() {
       program.memory_info[0].offset = static_cast<uint32_t>(offset);
       auto bounded = ExtractResourcePlan(program);
       auto reference = ExtractResourcePlan(program);
-      reference.srt_read_code.reset();
+      reference.srt_read_table.reset();
       const std::array<uint32_t, 3> edge = offset < 0
                                                ? std::array<uint32_t, 3>{0x80u, 0u, 0u}
                                                : std::array<uint32_t, 3>{0xfffffff0u, 0xffffu, 0u};
@@ -693,6 +693,163 @@ void TestCompiledSrtDescriptorReads() {
     }
     program.memory_info[0].offset = 0;
   }
+}
+
+// Compiled reads run from one table: one read per memoized read, after the reads of its words,
+// and descriptor DWORDs as immediates, user data or reads. Every outcome matches the walker's.
+void TestCompiledSrtReadTable() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Table = ResourcePlan::SrtReadTable;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 1u,
+                                  static_cast<uint32_t>(address >> 32u) | 0x55550000u};
+  };
+  std::array<uint32_t, 4> child{0u, 0x11111111u, 0x22222222u, 0x33333333u};
+  std::array<uint32_t, 16> constants{};
+  for (uint32_t i = 0; i < constants.size(); ++i) constants[i] = 0xc0000000u | i;
+  const auto child_words = pointer_words(child.data());
+  const auto constants_address = reinterpret_cast<uint64_t>(constants.data());
+  // Child pointer, a constant-buffer V# (base, stride, records, word 3), an index, a branch.
+  std::array<uint32_t, 8> root{child_words[0], child_words[1],
+                               static_cast<uint32_t>(constants_address),
+                               static_cast<uint32_t>(constants_address >> 32u), 64u, 0x12345678u,
+                               1u, 1u};
+  const auto root_words = pointer_words(root.data());
+  const std::array<uint32_t, 3> user_data{root_words[0], root_words[1], 0x0fa0u};
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &entry = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                {emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+                                 emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto load = [&](Value handle, uint32_t offset) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {handle, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto child_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                 {load(root_handle, 0u), load(root_handle, 4u)});
+  const auto buffer_handle =
+      emit(entry, ValueOpcode::GetBufferResource,
+           {load(root_handle, 8u), load(root_handle, 12u), load(root_handle, 16u),
+            load(root_handle, 20u)});
+  const auto index = load(root_handle, 24u);
+  const auto constant = [&](Value offset, uint32_t immediate) {
+    program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = immediate});
+    const auto value = emit(entry, ValueOpcode::ReadConstBuffer, {buffer_handle, offset});
+    value.Instruction()->SetFlags(
+        MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+    return value;
+  };
+  const auto shared = load(child_handle, 4u);
+  const std::array slot_values{shared, load(child_handle, 8u),
+                               constant(emit(entry, ValueOpcode::ShiftLeftLogical32,
+                                             {index, Value(2u)}),
+                                        0u),
+                               constant(Value(12u), 0u)};
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  for (uint32_t slot = 0; slot < slot_values.size(); ++slot) {
+    emit(entry, ValueOpcode::ReadConst, {srt, Value(slot)});
+    program.srt_reads.push_back({slot_values[slot], 3u - slot});
+  }
+  DescriptorSource descriptor;
+  descriptor.dwords = {Value(0x40u), emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(6))}),
+                       shared,
+                       constant(emit(entry, ValueOpcode::ShiftLeftLogical32, {index, Value(3u)}),
+                                4u)};
+  descriptor.dword_count = 4;
+  program.descriptor_sources.push_back(descriptor);
+  program.info.buffers.push_back({.source = 0});
+  entry.condition = emit(entry, ValueOpcode::INotEqual32, {load(root_handle, 28u), Value(0u)});
+  AddValueBlock(program);
+  AddValueBlock(program);
+  entry.terminator.kind = TerminatorKind::ConditionalBranch;
+  entry.terminator.true_block = program.blocks[1];
+  entry.terminator.false_block = program.blocks[2];
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+
+  auto plan = ExtractResourcePlan(program);
+  // Child pointer (2), child DWORDs (2), V# (4), index (1), constant-buffer DWORDs (3).
+  Check(plan.srt_code == nullptr && plan.srt_read_table != nullptr &&
+            plan.srt_read_table->reads.size() == 12u &&
+            plan.srt_read_addresses.size() == 12u &&
+            std::ranges::none_of(plan.srt_read_entries,
+                                 [](uint32_t read) { return read == UINT32_MAX; }) &&
+            plan.srt_descriptor_entries == std::vector<uint32_t>{0u},
+        "SRT read table lost a shared read or an entry");
+  const auto &table = *plan.srt_read_table;
+  for (uint32_t read = 0; read < table.reads.size(); ++read) {
+    const auto &entry_read = table.reads[read];
+    const auto earlier = [&](uint32_t word) { return (word & Table::UserData) != 0u || word < read; };
+    Check(std::ranges::all_of(std::span(entry_read.words).first(entry_read.buffer ? 4u : 2u),
+                              earlier) &&
+              (!entry_read.buffer || entry_read.shift == 0u || earlier(entry_read.offset)),
+          "SRT read table runs a read before the reads of its words");
+  }
+  Check(table.words.size() == 5u && table.words[0] == Table::Immediate && table.words[1] == 0x40u &&
+            table.words[2] == (Table::UserData | 2u) &&
+            table.words[3] == plan.srt_read_entries[0] && table.words[4] < table.reads.size() &&
+            table.reads[table.words[4]].buffer && table.reads[table.words[4]].shift == 4u &&
+            table.reads[table.words[4]].relative == 4,
+        "SRT read table changed the descriptor DWORDs");
+
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_read_table.reset();
+  const auto runtime = [](std::span<const uint32_t> words) {
+    return SrtRuntime{
+        .user_data = words,
+        .read_specialization_memory = +[](void *, uint64_t address, std::span<uint32_t> out) {
+          std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+          return true;
+        }};
+  };
+  uint32_t checked = 0;
+  uint32_t failed = 0;
+  for (const uint32_t length : {3u, 2u, 1u}) {
+    for (const uint32_t stride : {0u, 4u, 0x3fffu}) {
+      for (const uint32_t records : {0u, 3u, 4u, 16u, 28u, 64u}) {
+        for (const uint32_t entry_index : {0u, 1u, 5u, 6u, 0x40000001u}) {
+          for (const uint32_t branch : {0u, 1u}) {
+            root[3] = static_cast<uint32_t>(constants_address >> 32u) | (stride << 16u);
+            root[4] = records;
+            root[6] = entry_index;
+            root[7] = branch;
+            child[1] = 0x11110000u | checked;
+            ResourceSnapshot compiled_snapshot;
+            ResourceSnapshot interpreted_snapshot;
+            ResourceSpecialization specialization;
+            const auto words = std::span(user_data).first(length);
+            const bool compiled_ok =
+                MaterializeResources(plan, runtime(words), compiled_snapshot, specialization);
+            const bool interpreted_ok = MaterializeResources(interpreted, runtime(words),
+                                                             interpreted_snapshot, specialization);
+            Check(compiled_ok == interpreted_ok &&
+                      (!compiled_ok ||
+                       (compiled_snapshot.flattened_srt == interpreted_snapshot.flattened_srt &&
+                        compiled_snapshot.buffers == interpreted_snapshot.buffers &&
+                        compiled_snapshot.specialization_reads ==
+                            interpreted_snapshot.specialization_reads)),
+                  "SRT read table changed a value, a failure or the captured reads");
+            ++checked;
+            failed += compiled_ok ? 0u : 1u;
+          }
+        }
+      }
+    }
+  }
+  Check(failed != 0u && failed != checked, "SRT read table sweep missed successes or failures");
 }
 
 // One page that faults on reads, as for GPU writes elsewhere on it. The protected reader serves
@@ -821,10 +978,10 @@ void TestCompiledSrtLoadsFromProtectedPage() {
   program.blocks[2]->terminator.kind = TerminatorKind::Return;
   auto plan = ExtractResourcePlan(program);
   Check(plan.capture_specialization_reads && plan.srt_code == nullptr &&
-            plan.srt_read_code != nullptr && plan.srt_read_entries[2] != UINT32_MAX,
+            plan.srt_read_table != nullptr && plan.srt_read_entries[2] != UINT32_MAX,
         "protected-page plan did not compile its slot reads");
   auto interpreted = ExtractResourcePlan(program);
-  interpreted.srt_read_code.reset();
+  interpreted.srt_read_table.reset();
 
   // Tree plan: the whole walk is compiled, including the load of the child pointer.
   Program tree = SrtProgram(0u);
@@ -2212,6 +2369,7 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestCompiledSrtReadsFollowBlocks();
   TestCompiledSrtDescriptorReads();
+  TestCompiledSrtReadTable();
   TestCompiledSrtLoadsFromProtectedPage();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();

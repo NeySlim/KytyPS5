@@ -136,7 +136,9 @@ private:
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 	// Runs a compiled slot or descriptor entry; false when it fails or cannot run here.
-	bool     CallCompiledRead(uint32_t entry, uint32_t* out);
+	bool     CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor = false);
+	bool     CompiledWord(uint32_t word, uint32_t& value);
+	bool     CompiledRead(uint32_t index, uint32_t& value);
 	bool     EvaluateWithoutWaiting(Value value, uint32_t& result);
 	bool     KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo);
 	uint32_t NoWaitFailures() const;
@@ -153,6 +155,7 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 	std::vector<std::pair<uint64_t, uint64_t>>* m_captured_ranges = nullptr;
 	bool                                        m_compiled_reads  = false;
+	uint64_t*                                   m_cursor          = nullptr;
 	// Memos marked unknown while evaluating without waiting for pending GPU writes.
 	using UnknownLog = std::vector<std::pair<ResourcePlan::EvaluationContext*, uint32_t>>;
 	UnknownLog* m_no_wait_unknowns = nullptr;
