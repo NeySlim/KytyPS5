@@ -713,9 +713,44 @@ struct ResourcePlan {
 		std::vector<uint32_t> words;
 	};
 	std::unique_ptr<SrtReadTable> srt_read_table;
-	std::vector<uint32_t>         srt_read_entries;
-	std::vector<uint32_t>         srt_descriptor_entries;
-	mutable std::vector<uint64_t> srt_read_addresses;
+	// Block conditions run from a table: per control-flow block its root node (UINT32_MAX:
+	// interpreted). A node evaluates and memoizes its instruction as the walker does.
+	struct SrtConditionTable {
+		enum class Op : uint8_t {
+			Immediate,
+			UserData,
+			Fail,
+			Forward,
+			AddressRead,
+			BufferRead,
+			LogicalNot,
+			LogicalAnd,
+			LogicalOr,
+			IEqual32,
+			INotEqual32,
+			ULessThan32,
+			ULessThanEqual32,
+			UGreaterThan32,
+			BitwiseAnd32,
+			BitwiseOr32,
+			ShiftLeftLogical32,
+			ShiftRightLogical32,
+			IAdd32,
+			BitFieldUExtract,
+		};
+		struct Node {
+			uint64_t value = 0; // Immediate: value; UserData: index; reads: memory_info index
+			uint32_t memo  = 0;
+			uint32_t args[5] {};
+			Op       op = Op::Fail;
+		};
+		std::vector<Node> nodes;
+	};
+	std::unique_ptr<SrtConditionTable> srt_condition_table;
+	std::vector<uint32_t>              srt_condition_entries;
+	std::vector<uint32_t>              srt_read_entries;
+	std::vector<uint32_t>              srt_descriptor_entries;
+	mutable std::vector<uint64_t>      srt_read_addresses;
 	// Ascending offsets of the guest loads of srt_code, and where a faulting load resumes: the
 	// code then fails, and the walker reads that DWORD itself.
 	std::vector<uint32_t> srt_loads;
