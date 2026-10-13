@@ -19,6 +19,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Same values as read_specialization_memory, but fails instead of waiting for GPU writes.
+	SrtMemoryReader           try_read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	// Reads the DWORDs of a direct load that faulted on a protected page, waiting only for GPU
@@ -40,6 +42,7 @@ public:
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool TryReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 	SrtRuntime                                  m_source;
@@ -134,6 +137,7 @@ private:
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 	// Runs a compiled slot or descriptor entry; false when it fails or cannot run here.
 	bool CallCompiledRead(uint32_t entry, uint32_t* out);
+	bool EvaluateWithoutWaiting(Value value, uint32_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
