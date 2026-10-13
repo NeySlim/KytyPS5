@@ -119,6 +119,8 @@ public:
 	SrtWalker& operator=(const SrtWalker&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result);
+	// Evaluates the condition of a control-flow block, from its compiled nodes when it has them.
+	bool EvaluateCondition(uint32_t block, Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
@@ -139,11 +141,13 @@ private:
 	bool     CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor = false);
 	bool     CompiledWord(uint32_t word, uint32_t& value);
 	bool     CompiledRead(uint32_t index, uint32_t& value);
-	bool     EvaluateWithoutWaiting(Value value, uint32_t& result);
+	bool     EvaluateWithoutWaiting(uint32_t block, Value value, uint32_t& result);
 	bool     KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo);
 	uint32_t NoWaitFailures() const;
 	bool     MarkUnknown(ResourcePlan::EvaluationContext::Entry& memo, uint32_t index,
 	                     uint32_t failures);
+	bool     EvaluateNode(uint32_t index, uint64_t& result);
+	bool     EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node, uint64_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -156,6 +160,10 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>* m_captured_ranges = nullptr;
 	bool                                        m_compiled_reads  = false;
 	uint64_t*                                   m_cursor          = nullptr;
+	// Why the last compiled condition failed.
+	static constexpr uint8_t NodeUnsupported = 1u;
+	static constexpr uint8_t NodeReadFailed  = 2u;
+	uint8_t                  m_node_failures = 0;
 	// Memos marked unknown while evaluating without waiting for pending GPU writes.
 	using UnknownLog = std::vector<std::pair<ResourcePlan::EvaluationContext*, uint32_t>>;
 	UnknownLog* m_no_wait_unknowns = nullptr;

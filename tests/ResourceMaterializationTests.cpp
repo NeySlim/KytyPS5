@@ -852,6 +852,186 @@ void TestCompiledSrtReadTable() {
   Check(failed != 0u && failed != checked, "SRT read table sweep missed successes or failures");
 }
 
+// Block conditions run from compiled nodes with the walker's outcome: the same edges, failures
+// (both edges), memo values and captured reads. Unsupported operations stay interpreted.
+void TestCompiledSrtConditions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 2u,
+                                  static_cast<uint32_t>(address >> 32u) | 0x77770000u};
+  };
+  std::array<uint32_t, 8> constants{};
+  for (uint32_t i = 0; i < constants.size(); ++i) constants[i] = 3u + i;
+  const auto constants_address = reinterpret_cast<uint64_t>(constants.data());
+  // Condition words 0-8, a constant-buffer V# at 9-12, slot DWORDs at 13-22.
+  std::array<uint32_t, 23> root{};
+  root[9] = static_cast<uint32_t>(constants_address);
+  root[10] = static_cast<uint32_t>(constants_address >> 32u);
+  root[11] = 32u;
+  for (uint32_t i = 13; i < root.size(); ++i) root[i] = 0x5000u + i;
+  const auto root_words = pointer_words(root.data());
+  const std::array<uint32_t, 3> user_data{root_words[0], root_words[1], 6u};
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer});
+  auto &entry = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                {emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+                                 emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto word = [&](uint32_t index) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {root_handle, Value(index * 4u), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto buffer_handle = emit(entry, ValueOpcode::GetBufferResource,
+                                  {word(9), word(10), word(11), word(12)});
+  const auto constant = emit(entry, ValueOpcode::ReadConstBuffer,
+                             {buffer_handle, emit(entry, ValueOpcode::ShiftLeftLogical32,
+                                                  {word(6), Value(2u)})});
+  constant.Instruction()->SetFlags(MemoryFlags{.index = 1});
+  // The V# also binds a buffer, as constant-buffer reads require.
+  DescriptorSource descriptor;
+  descriptor.dwords = {word(9), word(10), word(11), word(12)};
+  descriptor.dword_count = 4;
+  program.descriptor_sources.push_back(descriptor);
+  program.info.buffers.push_back({.source = 0});
+  const auto undefined = emit(entry, ValueOpcode::UndefU1, {});
+  const auto user = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  const std::array conditions{
+      emit(entry, ValueOpcode::LogicalNot,
+           {emit(entry, ValueOpcode::ConditionRef,
+                 {emit(entry, ValueOpcode::LogicalNot,
+                       {emit(entry, ValueOpcode::IEqual32,
+                             {emit(entry, ValueOpcode::BitFieldUExtract,
+                                   {word(0), Value(4u), Value(3u)}),
+                              Value(5u)})})})}),
+      emit(entry, ValueOpcode::INotEqual32, {Value(0u), word(1)}),
+      emit(entry, ValueOpcode::INotEqual32,
+           {emit(entry, ValueOpcode::BitwiseAnd32, {word(2), Value(0x10u)}), Value(0u)}),
+      emit(entry, ValueOpcode::LogicalAnd,
+           {emit(entry, ValueOpcode::INotEqual32, {word(3), Value(0u)}), undefined}),
+      emit(entry, ValueOpcode::LogicalOr,
+           {emit(entry, ValueOpcode::ULessThan32, {word(4), Value(8u)}), undefined}),
+      emit(entry, ValueOpcode::IEqual32,
+           {emit(entry, ValueOpcode::ShiftRightLogical32,
+                 {emit(entry, ValueOpcode::IAdd32, {word(5), user}), Value(2u)}),
+            Value(3u)}),
+      emit(entry, ValueOpcode::UGreaterThan32, {constant, Value(5u)}),
+      emit(entry, ValueOpcode::LogicalNot,
+           {emit(entry, ValueOpcode::INotEqual32, {word(7), Value(2u)})}),
+      // Multiplication stays interpreted.
+      emit(entry, ValueOpcode::IEqual32,
+           {emit(entry, ValueOpcode::IMul32, {word(8), Value(3u)}), Value(9u)})};
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  // C0 -> (S0, C1), S0 -> C1, ..., the last condition block -> (S, end).
+  std::vector<Block *> checks{&entry};
+  for (uint32_t i = 1; i < conditions.size(); ++i) checks.push_back(&AddValueBlock(program));
+  std::vector<Block *> slots;
+  for (uint32_t i = 0; i < conditions.size(); ++i) {
+    auto &slot = AddValueBlock(program);
+    emit(slot, ValueOpcode::ReadConst, {srt, Value(i)});
+    program.srt_reads.push_back({word(13 + i), i});
+    slots.push_back(&slot);
+  }
+  auto &end = AddValueBlock(program);
+  end.terminator.kind = TerminatorKind::Return;
+  for (uint32_t i = 0; i < conditions.size(); ++i) {
+    Block *next = i + 1 < conditions.size() ? checks[i + 1] : &end;
+    checks[i]->condition = conditions[i];
+    checks[i]->terminator.kind = TerminatorKind::ConditionalBranch;
+    checks[i]->terminator.true_block = slots[i];
+    checks[i]->terminator.false_block = next;
+    slots[i]->terminator.kind = TerminatorKind::Branch;
+    slots[i]->terminator.true_block = next;
+  }
+
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.size() == 2u * conditions.size() + 1u &&
+            plan.srt_condition_table != nullptr &&
+            plan.srt_condition_entries.size() == plan.control_flow.size(),
+        "SRT plan did not compile its block conditions");
+  for (uint32_t block = 0; block < plan.control_flow.size(); ++block) {
+    const bool supported = !plan.control_flow[block].condition.IsEmpty() &&
+                           block != checks.back()->id;
+    Check((plan.srt_condition_entries[block] != UINT32_MAX) == supported,
+          "SRT plan compiled an unsupported condition or left a supported one interpreted");
+  }
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_condition_table.reset();
+  struct Strict {
+    const uint32_t *refused = nullptr;
+  } strict;
+  const auto runtime = [&](std::span<const uint32_t> words) {
+    return SrtRuntime{
+        .user_data = words,
+        .userdata = &strict,
+        .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> out) {
+          if (reinterpret_cast<const uint32_t *>(address) == static_cast<Strict *>(data)->refused)
+            return false;
+          std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+          return true;
+        }};
+  };
+  uint32_t taken = 0;
+  uint32_t both = 0;
+  uint32_t seed = 1;
+  for (uint32_t round = 0; round < 400; ++round) {
+    for (uint32_t i = 0; i < 9; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      const uint32_t bits = seed >> 8u;
+      root[i] = i == 0 ? (bits & 0x7fu) : i == 6 ? (bits % 12u) : (bits & 0x1fu);
+    }
+    strict.refused = round % 5u == 4u ? &root[round % 9u] : nullptr;
+    const auto words = std::span(user_data).first(round % 7u == 6u ? 2u : 3u);
+    ResourceSnapshot compiled_snapshot;
+    ResourceSnapshot interpreted_snapshot;
+    ResourceSpecialization specialization;
+    const bool compiled_ok =
+        MaterializeResources(plan, runtime(words), compiled_snapshot, specialization);
+    const bool interpreted_ok =
+        MaterializeResources(interpreted, runtime(words), interpreted_snapshot, specialization);
+    Check(compiled_ok == interpreted_ok &&
+              compiled_snapshot.flattened_srt == interpreted_snapshot.flattened_srt &&
+              compiled_snapshot.specialization_reads == interpreted_snapshot.specialization_reads &&
+              compiled_snapshot.buffers == interpreted_snapshot.buffers,
+          "compiled SRT conditions changed an edge, a failure or the captured reads");
+    for (const auto value : compiled_snapshot.flattened_srt) {
+      taken += value != 0u ? 1u : 0u;
+    }
+    both += compiled_ok && compiled_snapshot.flattened_srt[3] != 0u &&
+                    compiled_snapshot.flattened_srt[4] != 0u
+                ? 1u
+                : 0u;
+  }
+  Check(taken != 0u && both != 0u, "compiled SRT condition sweep missed taken or undecided edges");
+  {
+    // The clean memo keeps the DWORD a compiled condition read.
+    root[1] = 0x1234u;
+    const auto direct = runtime(user_data);
+    SrtWalker clean(plan, CleanRuntime(direct));
+    SrtWalker walker(plan, direct, &clean);
+    std::vector<uint32_t> flat;
+    Check(walker.RefreshFlatBuffer(flat), "compiled condition refresh failed");
+    root[1] = 0u;
+    uint32_t value = 0;
+    const auto read = plan.control_flow[checks[1]->id].condition.ResolveInstruction()->Arg(1);
+    Check(clean.Evaluate(read, value) && value == 0x1234u &&
+              flat[1] == root[14],
+          "compiled condition did not memoize its read for the walker");
+  }
+}
+
 // One page that faults on reads, as for GPU writes elsewhere on it. The protected reader serves
 // its bytes from a copy; the fault handler otherwise unprotects it, as the renderer does.
 struct ProtectedPage {
@@ -1535,8 +1715,11 @@ void TestPendingConditionFollowsBothEdges() {
 void TestNoWaitUnknownsKeepTheirMemo() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  // With a failed condition on a pending word, or with known conditions only.
-  for (const bool failed_condition : {true, false}) {
+  // With a failed condition on a pending word, or with known conditions only; compiled or
+  // interpreted.
+  for (const auto [failed_condition, compiled] :
+       {std::pair{true, true}, std::pair{false, true}, std::pair{true, false},
+        std::pair{false, false}}) {
     Program program;
     program.stage = Libs::Graphics::ShaderType::Compute;
     program.user_data_base = 4;
@@ -1589,8 +1772,12 @@ void TestNoWaitUnknownsKeepTheirMemo() {
     fourth.AddBranch(&exit);
     exit.terminator.kind = TerminatorKind::Return;
     auto plan = ExtractResourcePlan(program);
-    Check(plan.control_flow.size() == 5 && plan.capture_specialization_reads,
-          "no-wait memo plan did not keep its conditions");
+    Check(plan.control_flow.size() == 5 && plan.capture_specialization_reads &&
+              plan.srt_condition_table != nullptr &&
+              std::ranges::none_of(std::span(plan.srt_condition_entries).first(3),
+                                   [](uint32_t entry) { return entry == UINT32_MAX; }),
+          "no-wait memo plan did not compile its conditions");
+    if (!compiled) plan.srt_condition_table.reset();
 
     struct Reads {
       uint32_t tried = 0;
@@ -2370,6 +2557,7 @@ int main() {
   TestCompiledSrtReadsFollowBlocks();
   TestCompiledSrtDescriptorReads();
   TestCompiledSrtReadTable();
+  TestCompiledSrtConditions();
   TestCompiledSrtLoadsFromProtectedPage();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
