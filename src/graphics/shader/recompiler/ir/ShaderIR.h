@@ -737,6 +737,7 @@ struct ResourcePlan {
 			ShiftRightLogical32,
 			IAdd32,
 			BitFieldUExtract,
+			ControlPhi, // args[0], args[1]: first and count of phi_incoming
 		};
 		struct Node {
 			uint64_t value = 0; // Immediate: value; UserData: index; reads: memory_info index
@@ -744,7 +745,12 @@ struct ResourcePlan {
 			uint32_t args[5] {};
 			Op       op = Op::Fail;
 		};
-		std::vector<Node> nodes;
+		struct Incoming {
+			uint32_t node  = 0;
+			uint32_t block = 0; // predecessor, as in control_phi_predecessors
+		};
+		std::vector<Node>     nodes;
+		std::vector<Incoming> phi_incoming;
 	};
 	std::unique_ptr<SrtConditionTable> srt_condition_table;
 	std::vector<uint32_t>              srt_condition_entries;

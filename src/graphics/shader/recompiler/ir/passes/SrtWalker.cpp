@@ -818,6 +818,24 @@ void CompileSrtConditions(ResourcePlan& program) {
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32: arguments(Op::Forward, {inst->Arg(0)}); break;
 			case ValueOpcode::Phi: {
+				// Merges of the control flow take the incoming values of reachable predecessors.
+				if (const auto control = program.control_phi_predecessors.find(inst);
+				    control != program.control_phi_predecessors.end()) {
+					compiled = control->second.size() == inst->NumArgs();
+					std::vector<Table::Incoming> incoming;
+					for (size_t index = 0; compiled && index < inst->NumArgs(); ++index) {
+						const auto argument = self(self, inst->Arg(index));
+						compiled &= argument != UINT32_MAX;
+						incoming.push_back({argument, control->second[index]});
+					}
+					if (!compiled) break;
+					node.op      = Op::ControlPhi;
+					node.args[0] = static_cast<uint32_t>(table->phi_incoming.size());
+					node.args[1] = static_cast<uint32_t>(incoming.size());
+					table->phi_incoming.insert(table->phi_incoming.end(), incoming.begin(),
+					                           incoming.end());
+					break;
+				}
 				const auto invariant = ResolveInvariantPhi(program, Value(const_cast<Inst*>(inst)));
 				if (invariant.IsEmpty()) {
 					node.op = Op::Fail;
@@ -1637,6 +1655,20 @@ bool SrtWalker::EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node
 			result = m_runtime.user_data[node.value];
 			return true;
 		case Op::Forward: return EvaluateNode(node.args[0], result);
+		case Op::ControlPhi: {
+			const auto& table = *m_program.srt_condition_table;
+			bool        found = false;
+			for (uint32_t index = 0; index < node.args[1]; ++index) {
+				const auto& incoming = table.phi_incoming[node.args[0] + index];
+				if (m_reachable_blocks != nullptr && !m_reachable_blocks->at(incoming.block))
+					continue;
+				uint64_t value = 0;
+				if (!EvaluateNode(incoming.node, value) || (found && value != result)) return false;
+				result = value;
+				found  = true;
+			}
+			return found;
+		}
 		case Op::AddressRead:
 		case Op::BufferRead: {
 			uint64_t low    = 0;
