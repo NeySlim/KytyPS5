@@ -1032,6 +1032,77 @@ void TestCompiledSrtConditions() {
   }
 }
 
+// A merge Phi takes only the incoming values of reachable predecessors, compiled or not.
+void TestCompiledSrtControlPhi() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 6; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &left = *program.blocks[1];
+  auto &right = *program.blocks[2];
+  auto &merge = *program.blocks[3];
+  auto &use = *program.blocks[4];
+  auto &exit = *program.blocks[5];
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto branch = [](Block &block, Block &target, Value condition = {},
+                         Block *other = nullptr) {
+    block.terminator.kind = other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
+    block.terminator.true_block = &target;
+    block.terminator.false_block = other;
+    block.condition = condition;
+    block.AddBranch(&target);
+    if (other) block.AddBranch(other);
+  };
+  const auto flag = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  const auto slot = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  branch(entry, left, emit(entry, ValueOpcode::INotEqual32, {flag, Value(0u)}), &right);
+  branch(left, merge);
+  branch(right, merge);
+  auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
+  selected.SetFlags(Type::U32);
+  selected.AddPhiOperand(&left, Value(1u));
+  selected.AddPhiOperand(&right, Value(0u));
+  branch(merge, use, emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(0u)}), &exit);
+  emit(use, ValueOpcode::ReadConst, {srt, Value(0u)});
+  program.srt_reads.push_back({slot, 0u});
+  branch(use, exit);
+  exit.terminator.kind = TerminatorKind::Return;
+
+  auto plan = ExtractResourcePlan(program);
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_condition_table.reset();
+  Check(plan.srt_condition_table != nullptr &&
+            plan.srt_condition_entries.size() == plan.control_flow.size() &&
+            plan.srt_condition_entries[merge.id] != UINT32_MAX &&
+            std::ranges::none_of(plan.srt_condition_table->nodes,
+                                 [](const auto &node) {
+                                   return node.op == ResourcePlan::SrtConditionTable::Op::Fail;
+                                 }),
+        "SRT plan did not compile a merge Phi condition");
+  for (const uint32_t value : {0u, 1u}) {
+    const std::array<uint32_t, 2> user_data{value, 0x4321u};
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot compiled_snapshot;
+    ResourceSnapshot interpreted_snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, compiled_snapshot, specialization) &&
+              MaterializeResources(interpreted, runtime, interpreted_snapshot, specialization),
+          "merge Phi plan failed");
+    Check(compiled_snapshot.flattened_srt == interpreted_snapshot.flattened_srt &&
+              compiled_snapshot.flattened_srt.size() == 1 &&
+              compiled_snapshot.flattened_srt[0] == (value != 0u ? 0x4321u : 0u),
+          "compiled merge Phi took an unreachable predecessor or lost the reachable one");
+  }
+}
+
 // One page that faults on reads, as for GPU writes elsewhere on it. The protected reader serves
 // its bytes from a copy; the fault handler otherwise unprotects it, as the renderer does.
 struct ProtectedPage {
@@ -2558,6 +2629,7 @@ int main() {
   TestCompiledSrtDescriptorReads();
   TestCompiledSrtReadTable();
   TestCompiledSrtConditions();
+  TestCompiledSrtControlPhi();
   TestCompiledSrtLoadsFromProtectedPage();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
