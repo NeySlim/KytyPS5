@@ -795,7 +795,8 @@ void CompileSrtConditions(ResourcePlan& program) {
 		if (inst == nullptr) return UINT32_MAX;
 		if (const auto found = nodes.find(inst); found != nodes.end()) return found->second;
 		if (!visiting.insert(inst).second) return UINT32_MAX;
-		Table::Node node {.memo = inst->EvaluationIndex(program.evaluation_value_count)};
+		Table::Node node {.inst = inst,
+		                  .memo = inst->EvaluationIndex(program.evaluation_value_count)};
 		bool        compiled  = true;
 		const auto  arguments = [&](Op op, std::initializer_list<Value> values) {
 			node.op     = op;
@@ -810,7 +811,7 @@ void CompileSrtConditions(ResourcePlan& program) {
 				compiled = inst->NumArgs() == 1 && inst->Arg(0).GetType() == Type::ScalarReg;
 				if (!compiled) break;
 				const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-				node.op        = reg < program.user_data_base ? Op::Fail : Op::UserData;
+				node.op        = reg < program.user_data_base ? Op::Unknown : Op::UserData;
 				node.value     = reg < program.user_data_base ? 0u : reg - program.user_data_base;
 				break;
 			}
@@ -838,14 +839,14 @@ void CompileSrtConditions(ResourcePlan& program) {
 				}
 				const auto invariant = ResolveInvariantPhi(program, Value(const_cast<Inst*>(inst)));
 				if (invariant.IsEmpty()) {
-					node.op = Op::Fail;
+					node.op = Op::Unknown;
 				} else {
 					arguments(Op::Forward, {invariant});
 				}
 				break;
 			}
 			case ValueOpcode::UndefU1:
-			case ValueOpcode::UndefU32: node.op = Op::Fail; break;
+			case ValueOpcode::UndefU32: node.op = Op::Unknown; break;
 			case ValueOpcode::LoadAddressU32:
 			case ValueOpcode::ReadConstBuffer: {
 				const auto  index = inst->Flags<SrtReadFlags>().index;
@@ -935,6 +936,7 @@ SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker
     : m_program(parent.m_program),
       m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+      m_active_inst(m_active_mask.IsEmpty() ? nullptr : m_active_mask.TryInstruction()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
                     (clean_evaluator != nullptr ? 2u : 0u)),
@@ -1600,7 +1602,9 @@ bool SrtWalker::EvaluateCondition(uint32_t block, Value value, uint32_t& result)
 	uint64_t wide   = 0;
 	m_node_failures = 0;
 	if (!EvaluateNode(root, wide)) {
-		return m_node_failures == NodeUnsupported && Evaluate(value, result);
+		if (m_node_failures != NodeUnsupported) return false;
+		++m_program.srt_condition_fallbacks;
+		return Evaluate(value, result);
 	}
 	result = static_cast<uint32_t>(wide);
 	return true;
@@ -1611,6 +1615,10 @@ bool SrtWalker::EvaluateNode(uint32_t index, uint64_t& result) {
 	const auto& node = m_program.srt_condition_table->nodes[index];
 	if (node.op == ResourcePlan::SrtConditionTable::Op::Immediate) {
 		result = node.value;
+		return true;
+	}
+	if (m_active_inst != nullptr && node.inst == m_active_inst) {
+		result = 1u;
 		return true;
 	}
 	if (const auto& memo = m_context.values[node.memo]; memo.generation == m_context.generation) {
@@ -1729,9 +1737,12 @@ bool SrtWalker::EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node
 				result = 0u;
 				return true;
 			}
-			if (!EvaluateNode(node.args[1], b) || (b != 0u && !left)) return false;
-			result = b != 0u;
-			return true;
+			if (EvaluateNode(node.args[1], b) && (b == 0u || left)) {
+				result = b != 0u;
+				return true;
+			}
+			if (left) return false;
+			return EvaluateUnderMask(node.args[0], node.args[1], result);
 		}
 		case Op::LogicalOr: {
 			const bool left = EvaluateNode(node.args[0], a);
@@ -1755,6 +1766,26 @@ bool SrtWalker::EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node
 			result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
 			return true;
 		}
+		case Op::ULessThan32:
+			// No U32 is below zero, as in the walker.
+			if (!EvaluateNode(node.args[1], b)) return false;
+			if (static_cast<uint32_t>(b) == 0u) {
+				result = 0u;
+				return true;
+			}
+			if (!EvaluateNode(node.args[0], a)) return false;
+			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+			return true;
+		case Op::ULessThanEqual32:
+			if (!EvaluateNode(node.args[0], a)) return false;
+			if (a == 0u) {
+				result = 1u;
+				return true;
+			}
+			if (!EvaluateNode(node.args[1], b)) return false;
+			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+			return true;
+		case Op::Unknown: return false;
 		case Op::Immediate:
 		case Op::Fail: m_node_failures |= NodeUnsupported; return false;
 		default: break;
@@ -1765,8 +1796,6 @@ bool SrtWalker::EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node
 	switch (node.op) {
 		case Op::IEqual32: result = x == y; break;
 		case Op::INotEqual32: result = x != y; break;
-		case Op::ULessThan32: result = x < y; break;
-		case Op::ULessThanEqual32: result = x <= y; break;
 		case Op::UGreaterThan32: result = x > y; break;
 		case Op::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
 		case Op::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
@@ -1775,6 +1804,26 @@ bool SrtWalker::EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node
 		case Op::IAdd32: result = static_cast<uint32_t>(a + b); break;
 		default: return false;
 	}
+	return true;
+}
+
+// The LogicalAnd assumption of EvaluateInst: only lanes where the mask holds can make the
+// conjunction true, so the right side is evaluated in the memo context of that mask alone.
+bool SrtWalker::EvaluateUnderMask(uint32_t mask, uint32_t value, uint64_t& result) {
+	const auto* inst = m_program.srt_condition_table->nodes[mask].inst;
+	if (inst == nullptr) {
+		m_node_failures |= NodeUnsupported;
+		return false;
+	}
+	SrtWalker active(*this, Value(const_cast<Inst*>(inst)));
+	if (active.m_context.values.size() < m_program.evaluation_value_count) {
+		active.m_context.values.resize(m_program.evaluation_value_count);
+	}
+	uint64_t   right     = 0;
+	const bool evaluated = active.EvaluateNode(value, right);
+	m_node_failures |= active.m_node_failures;
+	if (!evaluated || right != 0u) return false;
+	result = 0u;
 	return true;
 }
 
