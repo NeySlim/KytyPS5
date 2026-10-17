@@ -148,11 +148,13 @@ private:
 	                     uint32_t failures);
 	bool     EvaluateNode(uint32_t index, uint64_t& result);
 	bool     EvaluateNodeOp(const ResourcePlan::SrtConditionTable::Node& node, uint64_t& result);
+	bool     EvaluateUnderMask(uint32_t mask, uint32_t value, uint64_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	const Inst*                                 m_active_inst      = nullptr;
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;

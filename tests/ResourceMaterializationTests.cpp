@@ -1103,6 +1103,159 @@ void TestCompiledSrtControlPhi() {
   }
 }
 
+// Compiled conditions make the EXEC assumption of the walker: the right side of a conjunction
+// whose mask is unknown is evaluated in the memo context of that mask, without the interpreter.
+void TestCompiledSrtExecAssumption() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  constexpr uint32_t depth = 8;
+  std::array<uint32_t, 24> root{};
+  for (uint32_t i = 8; i < root.size(); ++i) root[i] = 0x6000u + i;
+  const auto root_address = reinterpret_cast<uint64_t>(root.data());
+  const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(root_address),
+                                          static_cast<uint32_t>(root_address >> 32u)};
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &entry = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto op = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return emit(entry, opcode, args);
+  };
+  const auto handle = op(ValueOpcode::GetAddressResource,
+                         {op(ValueOpcode::GetUserData, {Value(ScalarReg(0))}),
+                          op(ValueOpcode::GetUserData, {Value(ScalarReg(1))})});
+  const auto word = [&](uint32_t index) {
+    const auto value =
+        op(ValueOpcode::LoadAddressU32, {handle, Value(index * 4u), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto m1 = op(ValueOpcode::UndefU1, {});
+  const auto m2 = op(ValueOpcode::UndefU1, {});
+  const auto lane = op(ValueOpcode::UndefU32, {});
+  const auto lane_mask = op(ValueOpcode::INotEqual32, {lane, word(3)});
+  auto chain = op(ValueOpcode::LogicalNot, {op(ValueOpcode::ULessThanEqual32, {word(4), lane})});
+  for (uint32_t i = 0; i < depth; ++i) {
+    chain = op(ValueOpcode::LogicalAnd,
+               {op(ValueOpcode::INotEqual32, {lane, Value(i)}),
+                op(ValueOpcode::LogicalOr, {chain, chain})});
+  }
+  const std::array conditions{
+      op(ValueOpcode::LogicalAnd, {m1, op(ValueOpcode::LogicalNot, {m1})}),
+      // The assumption of the previous condition stays in its own memo context.
+      op(ValueOpcode::LogicalNot, {m1}),
+      op(ValueOpcode::LogicalAnd, {m1, op(ValueOpcode::IEqual32, {word(0), Value(5u)})}),
+      // A nested assumption holds its own mask only.
+      op(ValueOpcode::LogicalAnd,
+         {m1, op(ValueOpcode::LogicalAnd,
+                 {m2, op(ValueOpcode::LogicalOr, {op(ValueOpcode::LogicalNot, {m1}),
+                                                  op(ValueOpcode::LogicalNot, {m2})})})}),
+      op(ValueOpcode::ULessThan32, {lane, word(1)}),
+      op(ValueOpcode::ULessThanEqual32, {word(2), lane}),
+      op(ValueOpcode::LogicalAnd, {lane_mask, op(ValueOpcode::LogicalNot, {lane_mask})}),
+      chain,
+      // A known left side needs no assumption.
+      op(ValueOpcode::LogicalAnd, {op(ValueOpcode::INotEqual32, {word(6), Value(0u)}),
+                                   op(ValueOpcode::IEqual32, {word(7), lane})}),
+      // Its read is made an unsupported node below.
+      op(ValueOpcode::LogicalAnd, {m1, op(ValueOpcode::IEqual32, {word(5), Value(1u)})})};
+  const auto srt = op(ValueOpcode::GetSrtResource, {});
+  std::vector<Block *> checks{&entry};
+  for (uint32_t i = 1; i < conditions.size(); ++i) checks.push_back(&AddValueBlock(program));
+  std::vector<Block *> slots;
+  for (uint32_t i = 0; i < conditions.size(); ++i) {
+    auto &slot = AddValueBlock(program);
+    emit(slot, ValueOpcode::ReadConst, {srt, Value(i)});
+    program.srt_reads.push_back({word(8 + i), i});
+    slots.push_back(&slot);
+  }
+  auto &end = AddValueBlock(program);
+  end.terminator.kind = TerminatorKind::Return;
+  for (uint32_t i = 0; i < conditions.size(); ++i) {
+    Block *next = i + 1 < conditions.size() ? checks[i + 1] : &end;
+    checks[i]->condition = conditions[i];
+    checks[i]->terminator.kind = TerminatorKind::ConditionalBranch;
+    checks[i]->terminator.true_block = slots[i];
+    checks[i]->terminator.false_block = next;
+    slots[i]->terminator.kind = TerminatorKind::Branch;
+    slots[i]->terminator.true_block = next;
+  }
+
+  auto plan = ExtractResourcePlan(program);
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_condition_table.reset();
+  for (const auto *check : checks) {
+    Check(plan.srt_condition_table != nullptr && check->id < plan.srt_condition_entries.size() &&
+              plan.srt_condition_entries[check->id] != UINT32_MAX,
+          "SRT plan left an EXEC-masked condition interpreted");
+  }
+  // An unsupported node still takes the interpreter, from inside an assumption as well.
+  {
+    auto &table = *plan.srt_condition_table;
+    const auto &equal = table.nodes[table.nodes[plan.srt_condition_entries[checks.back()->id]].args[1]];
+    table.nodes[equal.args[0]].op = ResourcePlan::SrtConditionTable::Op::Fail;
+  }
+  struct Reads {
+    uint32_t count = 0;
+  };
+  const auto runtime = [&](Reads &reads) {
+    return SrtRuntime{.user_data = user_data,
+                      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> out) {
+                        ++static_cast<Reads *>(data)->count;
+                        std::memcpy(out.data(), reinterpret_cast<const void *>(address),
+                                    out.size_bytes());
+                        return true;
+                      },
+                      .userdata = &reads};
+  };
+  std::array<uint32_t, 4> known{};
+  std::array<uint32_t, 4> unknown{};
+  uint32_t seed = 7;
+  for (uint32_t round = 0; round < 256; ++round) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      root[i] = i == 0 ? (seed >> 8u) % 8u : (seed >> 8u) % 3u;
+    }
+    // Known results; -1 is unknown.
+    const std::array<int, conditions.size()> expected{
+        0, -1, root[0] == 5u ? -1 : 0, -1, root[1] == 0u ? 0 : -1,
+        root[2] == 0u ? 1 : -1, 0, root[4] == 0u ? 0 : -1, root[6] == 0u ? 0 : -1, root[5] == 1u ? -1 : 0};
+    Reads compiled_reads;
+    Reads interpreted_reads;
+    SrtWalker compiled(plan, runtime(compiled_reads));
+    SrtWalker walker(interpreted, runtime(interpreted_reads));
+    for (uint32_t i = 0; i < conditions.size(); ++i) {
+      const auto block = checks[i]->id;
+      uint32_t compiled_value = 99;
+      uint32_t interpreted_value = 99;
+      const bool compiled_ok =
+          compiled.EvaluateCondition(block, plan.control_flow[block].condition, compiled_value);
+      const bool interpreted_ok = walker.EvaluateCondition(
+          block, interpreted.control_flow[block].condition, interpreted_value);
+      Check(compiled_ok == interpreted_ok && (!compiled_ok || compiled_value == interpreted_value),
+            "compiled EXEC assumption disagreed with the walker");
+      Check(compiled_ok == (expected[i] >= 0) &&
+                (!compiled_ok || compiled_value == static_cast<uint32_t>(expected[i])),
+            "compiled EXEC assumption decided an unknown edge or lost a known one");
+      const uint32_t sweep = i == 2 ? 0 : i == 4 ? 1 : i == 5 ? 2 : i == 7 ? 3 : 4;
+      if (sweep < 4) ++(compiled_ok ? known : unknown)[sweep];
+    }
+    Check(compiled_reads.count == interpreted_reads.count && compiled_reads.count <= depth + 16u,
+          "compiled EXEC assumption repeated or skipped scalar reads");
+  }
+  // Only the unsupported load takes the interpreter, once per walk.
+  Check(plan.srt_condition_fallbacks == 256u,
+        "compiled EXEC assumption fell back to the interpreter or hid an unsupported node");
+  Check(std::ranges::all_of(known, [](uint32_t n) { return n != 0u; }) &&
+            std::ranges::all_of(unknown, [](uint32_t n) { return n != 0u; }),
+        "compiled EXEC assumption sweep missed known or unknown conditions");
+}
+
 // One page that faults on reads, as for GPU writes elsewhere on it. The protected reader serves
 // its bytes from a copy; the fault handler otherwise unprotects it, as the renderer does.
 struct ProtectedPage {
@@ -2630,6 +2783,7 @@ int main() {
   TestCompiledSrtReadTable();
   TestCompiledSrtConditions();
   TestCompiledSrtControlPhi();
+  TestCompiledSrtExecAssumption();
   TestCompiledSrtLoadsFromProtectedPage();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();

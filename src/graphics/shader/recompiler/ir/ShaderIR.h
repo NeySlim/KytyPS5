@@ -738,12 +738,14 @@ struct ResourcePlan {
 			IAdd32,
 			BitFieldUExtract,
 			ControlPhi, // args[0], args[1]: first and count of phi_incoming
+			Unknown,    // fails as the walker does (Undef, a varying Phi), without falling back
 		};
 		struct Node {
-			uint64_t value = 0; // Immediate: value; UserData: index; reads: memory_info index
-			uint32_t memo  = 0;
-			uint32_t args[5] {};
-			Op       op = Op::Fail;
+			uint64_t    value = 0; // Immediate: value; UserData: index; reads: memory_info index
+			const Inst* inst  = nullptr;
+			uint32_t    memo  = 0;
+			uint32_t    args[5] {};
+			Op          op = Op::Fail;
 		};
 		struct Incoming {
 			uint32_t node  = 0;
@@ -754,9 +756,11 @@ struct ResourcePlan {
 	};
 	std::unique_ptr<SrtConditionTable> srt_condition_table;
 	std::vector<uint32_t>              srt_condition_entries;
-	std::vector<uint32_t>              srt_read_entries;
-	std::vector<uint32_t>              srt_descriptor_entries;
-	mutable std::vector<uint64_t>      srt_read_addresses;
+	// Conditions the walker interpreted again after an unsupported node (GPU thread).
+	mutable uint64_t              srt_condition_fallbacks = 0;
+	std::vector<uint32_t>         srt_read_entries;
+	std::vector<uint32_t>         srt_descriptor_entries;
+	mutable std::vector<uint64_t> srt_read_addresses;
 	// Ascending offsets of the guest loads of srt_code, and where a faulting load resumes: the
 	// code then fails, and the walker reads that DWORD itself.
 	std::vector<uint32_t> srt_loads;
