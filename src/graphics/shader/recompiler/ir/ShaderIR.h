@@ -756,6 +756,8 @@ struct ResourcePlan {
 	};
 	std::unique_ptr<SrtConditionTable> srt_condition_table;
 	std::vector<uint32_t>              srt_condition_entries;
+	// Per block: the compiled condition is never known and reads no memory.
+	std::vector<uint8_t> srt_condition_unknown;
 	// Conditions the walker interpreted again after an unsupported node (GPU thread).
 	mutable uint64_t              srt_condition_fallbacks = 0;
 	std::vector<uint32_t>         srt_read_entries;
