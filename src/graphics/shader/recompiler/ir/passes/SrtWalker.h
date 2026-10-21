@@ -143,6 +143,7 @@ private:
 	bool     CompiledRead(uint32_t index, uint32_t& value);
 	bool     EvaluateWithoutWaiting(uint32_t block, Value value, uint32_t& result);
 	bool     KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo);
+	bool     BaseValue(uint32_t index, uint64_t& result) const;
 	uint32_t NoWaitFailures() const;
 	bool     MarkUnknown(ResourcePlan::EvaluationContext::Entry& memo, uint32_t index,
 	                     uint32_t failures);
@@ -172,6 +173,8 @@ private:
 	UnknownLog  m_no_wait_log;
 	// Readers that failed while evaluating without waiting.
 	uint32_t* m_no_wait_failures = nullptr;
+	// The memo of the nearest walker of this session without an EXEC mask, same read policy.
+	const ResourcePlan::EvaluationContext* m_base_context = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
