@@ -941,7 +941,10 @@ SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
                     (clean_evaluator != nullptr ? 2u : 0u)),
       m_context(AcquireContext()), m_no_wait_unknowns(parent.m_no_wait_unknowns),
-      m_no_wait_failures(parent.m_no_wait_failures) {}
+      m_no_wait_failures(parent.m_no_wait_failures),
+      m_base_context(m_read_policy != parent.m_read_policy ? nullptr
+                     : parent.m_active_mask.IsEmpty()      ? &parent.m_context
+                                                           : parent.m_base_context) {}
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
@@ -1022,6 +1025,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		result = m_context.values[index].value;
 		return true;
 	}
+	if (BaseValue(index, result)) return true;
 	// Visiting and completed-unknown entries both stop repeated evaluation in this
 	// context. Only completed unknowns are retried when reachability becomes tighter.
 	if (KnownUnknown(m_context.values[index])) return false;
@@ -1046,6 +1050,15 @@ bool SrtWalker::KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo)
 	}
 	return memo.generation == (m_context.generation | 1u) ||
 	       memo.generation == (m_context.generation | 2u);
+}
+
+// A value known without an EXEC assumption holds under any of them, read policy unchanged.
+bool SrtWalker::BaseValue(uint32_t index, uint64_t& result) const {
+	if (m_base_context == nullptr || index >= m_base_context->values.size()) return false;
+	const auto& memo = m_base_context->values[index];
+	if (memo.generation != m_base_context->generation) return false;
+	result = memo.value;
+	return true;
 }
 
 uint32_t SrtWalker::NoWaitFailures() const {
@@ -1623,6 +1636,8 @@ bool SrtWalker::EvaluateNode(uint32_t index, uint64_t& result) {
 	}
 	if (const auto& memo = m_context.values[node.memo]; memo.generation == m_context.generation) {
 		result = memo.value;
+		return true;
+	} else if (BaseValue(node.memo, result)) {
 		return true;
 	} else if (KnownUnknown(memo)) {
 		return false;

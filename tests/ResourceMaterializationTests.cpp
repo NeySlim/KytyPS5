@@ -2054,6 +2054,74 @@ void TestNoWaitUnknownsKeepTheirMemo() {
   }
 }
 
+// Under an EXEC assumption, values the session already knows without it are not evaluated or read
+// again: they hold for every lane.
+void TestExecAssumptionReusesKnownValues() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 4; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &second = *program.blocks[1];
+  auto &third = *program.blocks[2];
+  auto &exit = *program.blocks[3];
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto branch = [](Block &block, Value condition, Block &yes, Block &no) {
+    block.condition = condition;
+    block.terminator.kind = TerminatorKind::ConditionalBranch;
+    block.terminator.true_block = &yes;
+    block.terminator.false_block = &no;
+    block.AddBranch(&yes);
+    block.AddBranch(&no);
+  };
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto table = emit(entry, ValueOpcode::GetAddressResource, {Value(0x2000u), Value(0u)});
+  const auto word = emit(entry, ValueOpcode::LoadAddressU32,
+                         {table, Value(0u), Value(0u), Value(true)});
+  word.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  const auto matches = emit(entry, ValueOpcode::IEqual32, {word, Value(5u)});
+  const auto lane = emit(entry, ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
+  branch(entry, matches, second, third);
+  branch(second, emit(second, ValueOpcode::LogicalAnd, {active, matches}), third, exit);
+  third.terminator.kind = TerminatorKind::Branch;
+  third.terminator.true_block = &exit;
+  third.AddBranch(&exit);
+  exit.terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.size() == 4 && plan.capture_specialization_reads &&
+            plan.srt_condition_table != nullptr && plan.srt_condition_entries[1] != UINT32_MAX,
+        "EXEC reuse plan did not compile its conjunction");
+
+  uint32_t reads = 0;
+  const SrtRuntime runtime{
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++*static_cast<uint32_t *>(data);
+        words[0] = address == 0x2000u ? 5u : 0u;
+        return true;
+      },
+      .try_read_specialization_memory =
+          +[](void *data, uint64_t address, std::span<uint32_t> words) {
+            ++*static_cast<uint32_t *>(data);
+            words[0] = address == 0x2000u ? 5u : 0u;
+            return true;
+          }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "EXEC reuse plan failed to materialize");
+  // The conjunction stays unknown: its right side is true under the mask, as without it.
+  Check(plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1}),
+        "EXEC reuse plan visited the wrong blocks");
+  Check(reads == 1u, "EXEC assumption read a word the session already knew");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -2795,6 +2863,7 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestPendingConditionFollowsBothEdges();
   TestNoWaitUnknownsKeepTheirMemo();
+  TestExecAssumptionReusesKnownValues();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
