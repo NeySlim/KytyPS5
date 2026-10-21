@@ -2122,6 +2122,100 @@ void TestExecAssumptionReusesKnownValues() {
   Check(reads == 1u, "EXEC assumption read a word the session already knew");
 }
 
+// A compiled condition that no input can make known and that reads no memory is not evaluated:
+// its block follows both edges at once. Conditions that may be known still run.
+void TestNeverKnownConditionsAreNotEvaluated() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 7; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &second = *program.blocks[1];
+  auto &third = *program.blocks[2];
+  auto &fourth = *program.blocks[3];
+  auto &fifth = *program.blocks[4];
+  auto &tail = *program.blocks[5];
+  auto &exit = *program.blocks[6];
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto branch = [](Block &block, Value condition, Block &yes, Block &no) {
+    block.condition = condition;
+    block.terminator.kind = TerminatorKind::ConditionalBranch;
+    block.terminator.true_block = &yes;
+    block.terminator.false_block = &no;
+    block.AddBranch(&yes);
+    block.AddBranch(&no);
+  };
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto table = emit(entry, ValueOpcode::GetAddressResource, {Value(0x2000u), Value(0u)});
+  const auto word = emit(entry, ValueOpcode::LoadAddressU32,
+                         {table, Value(0u), Value(0u), Value(true)});
+  word.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  const auto user = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+  const auto lane = emit(entry, ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto first_lane = emit(entry, ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
+  // Never known, no read: not evaluated.
+  branch(entry, first_lane, second, exit);
+  // Never known, but it reads a word: still evaluated, so the read is captured.
+  branch(second, emit(second, ValueOpcode::IEqual32, {word, lane}), third, exit);
+  // Known when the bound is zero: may be known.
+  branch(third, emit(third, ValueOpcode::ULessThan32, {lane, user}), fourth, exit);
+  // The right side holds under the mask: may be known.
+  branch(fourth, emit(fourth, ValueOpcode::LogicalAnd, {active, emit(fourth, ValueOpcode::IEqual32,
+                                                                       {user, Value(1u)})}),
+         fifth, exit);
+  // A conjunction of two lane values: never known, no read.
+  branch(fifth, emit(fifth, ValueOpcode::LogicalAnd, {active, first_lane}), tail, exit);
+  tail.terminator.kind = TerminatorKind::Branch;
+  tail.terminator.true_block = &exit;
+  tail.AddBranch(&exit);
+  exit.terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.size() == 7 && plan.srt_condition_table != nullptr &&
+            std::ranges::all_of(std::span(plan.srt_condition_entries).first(5),
+                                [](uint32_t root) { return root != UINT32_MAX; }),
+        "never-known plan did not compile its conditions");
+  Check(plan.srt_condition_unknown == std::vector<uint8_t>({1, 0, 0, 0, 1, 0, 0}),
+        "never-known conditions were not found or a condition that may be known was skipped");
+
+  uint32_t reads = 0;
+  const std::array<uint32_t, 1> user_data{1u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++*static_cast<uint32_t *>(data);
+        words[0] = 3u;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "never-known plan failed to materialize");
+  Check(plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1, 1, 1, 1}) && reads == 1u &&
+            snapshot.specialization_reads ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 4u}},
+        "never-known plan changed reachability or captured reads");
+  const ResourcePlan::EvaluationContext *context = nullptr;
+  for (const auto &candidate : plan.evaluation_contexts)
+    if (candidate.active_mask.IsEmpty() && candidate.read_policy == 0u && !candidate.values.empty())
+      context = &candidate;
+  Check(context != nullptr, "never-known plan has no evaluation context");
+  const auto memo = [&](uint32_t block) {
+    const auto *inst = plan.control_flow[block].condition.Resolve().TryInstruction();
+    const auto index = inst->EvaluationIndex(plan.evaluation_value_count);
+    return index < context->values.size() ? context->values[index].generation : 0u;
+  };
+  Check(memo(0) == 0u && memo(4) == 0u, "a never-known condition was evaluated");
+  Check(memo(1) == (context->generation | 2u), "a condition that reads memory was not evaluated");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -2864,6 +2958,7 @@ int main() {
   TestPendingConditionFollowsBothEdges();
   TestNoWaitUnknownsKeepTheirMemo();
   TestExecAssumptionReusesKnownValues();
+  TestNeverKnownConditionsAreNotEvaluated();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();

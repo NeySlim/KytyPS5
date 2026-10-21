@@ -763,6 +763,7 @@ void CompileTreeWalker(ResourcePlan& program) {
 // interpreted.
 void CompileSrtConditions(ResourcePlan& program) {
 	program.srt_condition_entries.assign(program.control_flow.size(), UINT32_MAX);
+	program.srt_condition_unknown.clear();
 	if (!program.srt_plan_complete) return;
 	using Table = ResourcePlan::SrtConditionTable;
 	using Op    = Table::Op;
@@ -909,7 +910,79 @@ void CompileSrtConditions(ResourcePlan& program) {
 		program.srt_condition_entries[block] = compile(compile, condition);
 		any |= program.srt_condition_entries[block] != UINT32_MAX;
 	}
-	if (any) program.srt_condition_table = std::move(table);
+	if (!any) return;
+	// Nodes are pushed after their arguments. A node may be known unless it needs a node that
+	// is never known; the right side of a conjunction also when it uses the mask, which is known
+	// under its own EXEC assumption. A condition that is never known and reads no memory can only
+	// fail, so it is not evaluated.
+	const auto&          table_nodes = table->nodes;
+	std::vector<uint8_t> may_know(table_nodes.size(), 0u);
+	std::vector<uint8_t> reads(table_nodes.size(), 0u);
+	const auto           arguments = [&](const Table::Node& node, auto&& visit) {
+		if (node.op == Op::ControlPhi) {
+			for (uint32_t phi = 0; phi < node.args[1]; ++phi)
+				visit(table->phi_incoming[node.args[0] + phi].node);
+			return;
+		}
+		uint32_t arity = 2u;
+		switch (node.op) {
+			case Op::Immediate:
+			case Op::UserData:
+			case Op::Fail:
+			case Op::Unknown: arity = 0u; break;
+			case Op::Forward:
+			case Op::LogicalNot: arity = 1u; break;
+			case Op::AddressRead:
+			case Op::BitFieldUExtract: arity = 3u; break;
+			case Op::BufferRead: arity = 5u; break;
+			default: break;
+		}
+		for (uint32_t arg = 0; arg < arity; ++arg)
+			visit(node.args[arg]);
+	};
+	const auto uses = [&](uint32_t root, uint32_t target) {
+		std::vector<uint8_t>  seen(table_nodes.size(), 0u);
+		std::vector<uint32_t> stack {root};
+		while (!stack.empty()) {
+			const auto index = stack.back();
+			stack.pop_back();
+			if (index == target) return true;
+			if (seen[index]) continue;
+			seen[index] = 1u;
+			arguments(table_nodes[index], [&](uint32_t arg) { stack.push_back(arg); });
+		}
+		return false;
+	};
+	for (uint32_t index = 0; index < table_nodes.size(); ++index) {
+		const auto& node = table_nodes[index];
+		bool        all  = true;
+		bool        one  = false;
+		bool read = node.op == Op::AddressRead || node.op == Op::BufferRead || node.op == Op::Fail;
+		arguments(node, [&](uint32_t arg) {
+			all &= may_know[arg] != 0u;
+			one |= may_know[arg] != 0u;
+			read |= reads[arg] != 0u;
+		});
+		bool known = all;
+		switch (node.op) {
+			case Op::Unknown: known = false; break;
+			case Op::LogicalAnd: known = one || uses(node.args[1], node.args[0]); break;
+			case Op::LogicalOr:
+			case Op::ControlPhi: known = one; break;
+			case Op::ULessThan32: known = may_know[node.args[1]] != 0u; break;
+			case Op::ULessThanEqual32: known = may_know[node.args[0]] != 0u; break;
+			default: break;
+		}
+		may_know[index] = known ? 1u : 0u;
+		reads[index]    = read ? 1u : 0u;
+	}
+	program.srt_condition_unknown.assign(program.control_flow.size(), 0u);
+	for (uint32_t block = 0; block < program.control_flow.size(); ++block) {
+		const auto root = program.srt_condition_entries[block];
+		if (root != UINT32_MAX && !may_know[root] && !reads[root])
+			program.srt_condition_unknown[block] = 1u;
+	}
+	program.srt_condition_table = std::move(table);
 }
 
 } // namespace
@@ -1607,6 +1680,8 @@ bool SrtWalker::EvaluateCondition(uint32_t block, Value value, uint32_t& result)
 	                      ? m_program.srt_condition_entries[block]
 	                      : UINT32_MAX;
 	if (root == UINT32_MAX) return Evaluate(value, result);
+	if (block < m_program.srt_condition_unknown.size() && m_program.srt_condition_unknown[block])
+		return false;
 	if (m_context.values.size() < m_program.evaluation_value_count) {
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
